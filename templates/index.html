@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Network Guardian</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <!-- Header -->
+    <header class="header">
+        <div class="header-brand">
+            <div class="shield-icon">&#128737;</div>
+            <div>
+                <h1>AI Network Guardian</h1>
+                <p class="subtitle">AI-Assisted TCP/IP Network Diagnosis System &mdash; <span id="ai-mode-badge" class="ai-mode-badge">loading...</span></p>
+            </div>
+        </div>
+    </header>
+
+    <!-- Tab Navigation -->
+    <nav class="tab-nav">
+        <button class="tab-btn active" data-tab="detective">
+            <span class="tab-icon">&#128269;</span>
+            Network Detective
+            <span class="tab-layer">L1/L2</span>
+        </button>
+        <button class="tab-btn" data-tab="security">
+            <span class="tab-icon">&#128274;</span>
+            Security Hunter
+            <span class="tab-layer">L7</span>
+        </button>
+        <button class="tab-btn" data-tab="performance">
+            <span class="tab-icon">&#9889;</span>
+            Performance Monitor
+            <span class="tab-layer">L3/L4</span>
+        </button>
+    </nav>
+
+    <!-- Main Content -->
+    <main class="content">
+
+        <!-- Network Detective Module -->
+        <section id="tab-detective" class="tab-content active">
+            <div class="module-header">
+                <h2>Network Detective</h2>
+                <p>Discover devices on your local network using ARP inspection and ping sweep. Identifies vendors, device types, and detects unknown connections.</p>
+            </div>
+            <div class="action-bar">
+                <button id="btn-scan-network" class="btn-primary" onclick="runDetectiveScan()">
+                    Scan Network
+                </button>
+                <button class="btn-secondary" onclick="loadHistory('detective')">View History</button>
+            </div>
+            <div id="detective-loading" class="loading hidden">
+                <div class="spinner"></div>
+                <p>Scanning network... This may take a moment.</p>
+            </div>
+            <div id="detective-results" class="results-area"></div>
+        </section>
+
+        <!-- Security Hunter Module -->
+        <section id="tab-security" class="tab-content">
+            <div class="module-header">
+                <h2>Security Hunter</h2>
+                <p>Evaluate website security by analyzing HTTPS certificates, WHOIS data, and phishing risk indicators at the Application layer.</p>
+            </div>
+            <div class="action-bar">
+                <div class="input-group">
+                    <input type="text" id="url-input" placeholder="Enter URL (e.g., example.com)"
+                           onkeydown="if(event.key==='Enter')runSecurityAnalysis()">
+                    <button class="btn-primary" onclick="runSecurityAnalysis()">
+                        Analyze URL
+                    </button>
+                </div>
+                <button class="btn-secondary" onclick="loadHistory('security')">View History</button>
+            </div>
+            <div id="security-loading" class="loading hidden">
+                <div class="spinner"></div>
+                <p>Analyzing URL security...</p>
+            </div>
+            <div id="security-results" class="results-area"></div>
+        </section>
+
+        <!-- Performance Monitor Module -->
+        <section id="tab-performance" class="tab-content">
+            <div class="module-header">
+                <h2>Performance & Lag Monitor</h2>
+                <p>Measure ping latency, analyze active connections, and diagnose the causes of network performance degradation.</p>
+            </div>
+            <div class="action-bar">
+                <div class="input-group">
+                    <input type="text" id="perf-host" placeholder="Target host (default: 8.8.8.8)" value="8.8.8.8">
+                    <label class="ping-count-label">
+                        Pings:
+                        <input type="number" id="perf-count" value="10" min="3" max="20">
+                    </label>
+                    <button class="btn-primary" onclick="runPerformanceDiag()">
+                        Run Diagnostics
+                    </button>
+                </div>
+                <button class="btn-secondary" onclick="loadHistory('performance')">View History</button>
+            </div>
+            <div id="performance-loading" class="loading hidden">
+                <div class="spinner"></div>
+                <p>Running performance diagnostics...</p>
+            </div>
+            <div id="performance-results" class="results-area"></div>
+        </section>
+    </main>
+
+    <!-- History Modal -->
+    <div id="history-modal" class="modal hidden">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Scan History</h3>
+                <button class="modal-close" onclick="closeHistory()">&times;</button>
+            </div>
+            <div id="history-body" class="modal-body"></div>
+        </div>
+    </div>
+
+    <footer class="footer">
+        <p>AI Network Guardian &mdash; Hamide Sila AKDAN & Bekir Sadik ALTUNKAYA</p>
+    </footer>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
