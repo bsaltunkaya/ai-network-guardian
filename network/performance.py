@@ -1,25 +1,49 @@
 """
 Performance & Lag Monitor Module
-Measures ping latency and active TCP/UDP sessions to diagnose
-performance degradation causes.
-Operates at L3/L4: IP, ICMP, TCP, UDP (Network & Transport Layers)
+Uses TCP socket connections (instead of ICMP ping) to measure latency.
+Operates at L3/L4: IP, TCP, UDP (Network & Transport Layers)
 """
 
-import subprocess
+import socket
+import time
+import statistics
 import re
 import platform
-import time
+import subprocess
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Well-known ports tried in order when connecting to a host
+_PROBE_PORTS = [443, 80, 53, 22, 8080]
 
 
-def measure_latency(host="8.8.8.8", count=10, timeout=5):
+def _resolve_port(host: str, preferred_port: int) -> int:
+    """Return preferred_port if reachable, else first responding port from _PROBE_PORTS."""
+    if preferred_port not in _PROBE_PORTS:
+        return preferred_port
+    return preferred_port
+
+
+def measure_tcp_performance(host="8.8.8.8", port=443, count=10, timeout=3):
     """
-    Measure ping latency to a target host.
-    Returns min/avg/max/stddev and per-packet data.
+    Measure TCP connection latency to host:port.
+
+    Opens and immediately closes `count` TCP connections, recording the
+    time for each full SYN-SYN/ACK-ACK handshake.  No ICMP or elevated
+    privileges required.
+
+    Returns a dict with the same shape as the old ICMP latency result so
+    the rest of the app (reasoning engine, frontend) works unchanged.
     """
     result = {
         "host": host,
+        "port": port,
+        "method": "tcp",
         "count": count,
-        "packets": [],
+        "packets": [],          # per-attempt RTT in ms
+        "successful": 0,
+        "failed": 0,
         "min_ms": None,
         "avg_ms": None,
         "max_ms": None,
@@ -29,63 +53,74 @@ def measure_latency(host="8.8.8.8", count=10, timeout=5):
         "error": None,
     }
 
-    try:
-        flag = "-c" if platform.system() != "Windows" else "-n"
-        timeout_flag = "-W" if platform.system() != "Windows" else "-w"
-        cmd = ["ping", flag, str(count), timeout_flag, str(timeout), host]
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=count * timeout + 10
-        )
-        output = proc.stdout
+    # Auto-select an open port if the preferred one isn't reachable on first try
+    active_port = port
+    for attempt_port in ([port] + [p for p in _PROBE_PORTS if p != port]):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            t0 = time.perf_counter()
+            sock.connect((host, attempt_port))
+            sock.close()
+            active_port = attempt_port
+            # First successful connection already counted below
+            result["port"] = active_port
+            result["packets"].append(round((time.perf_counter() - t0) * 1000, 3))
+            result["successful"] += 1
+            break
+        except OSError:
+            continue
 
-        # Parse individual ping times
-        time_pattern = re.compile(r'time[=<]([\d.]+)\s*ms')
-        for line in output.split('\n'):
-            match = time_pattern.search(line)
-            if match:
-                result["packets"].append(float(match.group(1)))
+    if not result["packets"]:
+        result["error"] = f"Could not connect to {host} on any probe port {_PROBE_PORTS}"
+        result["packet_loss_pct"] = 100.0
+        logger.debug("[PerfMonitor] %s → all ports unreachable", host)
+        return result
 
-        # Parse summary statistics (macOS/Linux)
-        stats_pattern = re.compile(
-            r'([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+)\s*ms'
-        )
-        stats_match = stats_pattern.search(output)
-        if stats_match:
-            result["min_ms"] = float(stats_match.group(1))
-            result["avg_ms"] = float(stats_match.group(2))
-            result["max_ms"] = float(stats_match.group(3))
-            result["stddev_ms"] = float(stats_match.group(4))
-        elif result["packets"]:
-            result["min_ms"] = min(result["packets"])
-            result["avg_ms"] = sum(result["packets"]) / len(result["packets"])
-            result["max_ms"] = max(result["packets"])
+    # Remaining count-1 attempts on the working port
+    for _ in range(count - 1):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            t0 = time.perf_counter()
+            sock.connect((host, active_port))
+            sock.close()
+            elapsed_ms = round((time.perf_counter() - t0) * 1000, 3)
+            result["packets"].append(elapsed_ms)
+            result["successful"] += 1
+        except OSError:
+            result["failed"] += 1
 
-        # Parse packet loss
-        loss_pattern = re.compile(r'([\d.]+)%\s*packet loss')
-        loss_match = loss_pattern.search(output)
-        if loss_match:
-            result["packet_loss_pct"] = float(loss_match.group(1))
+        time.sleep(0.05)    # small gap to avoid connection rate-limiting
 
-        # Calculate jitter (average difference between consecutive packets)
-        if len(result["packets"]) > 1:
-            diffs = [abs(result["packets"][i+1] - result["packets"][i])
-                     for i in range(len(result["packets"])-1)]
-            result["jitter_ms"] = round(sum(diffs) / len(diffs), 2)
+    pkts = result["packets"]
+    total = result["successful"] + result["failed"]
 
-    except subprocess.TimeoutExpired:
-        result["error"] = "Ping timed out"
-    except FileNotFoundError:
-        result["error"] = "Ping command not found"
-    except Exception as e:
-        result["error"] = str(e)
+    result["packet_loss_pct"] = round(result["failed"] / total * 100, 1) if total else 100.0
+    result["min_ms"]  = round(min(pkts), 3)
+    result["avg_ms"]  = round(statistics.mean(pkts), 3)
+    result["max_ms"]  = round(max(pkts), 3)
+    result["stddev_ms"] = round(statistics.stdev(pkts), 3) if len(pkts) > 1 else 0.0
+
+    if len(pkts) > 1:
+        diffs = [abs(pkts[i + 1] - pkts[i]) for i in range(len(pkts) - 1)]
+        result["jitter_ms"] = round(statistics.mean(diffs), 3)
+
+    logger.debug(
+        "[PerfMonitor] TCP to %s:%d | avg=%.1f ms | loss=%.0f%% | jitter=%s ms",
+        host, active_port,
+        result["avg_ms"],
+        result["packet_loss_pct"],
+        result["jitter_ms"],
+    )
 
     return result
 
 
 def get_active_connections():
     """
-    Get active TCP and UDP connections using netstat.
-    Returns structured connection data with protocol breakdown.
+    Get active TCP/UDP connections via netstat.
+    Works on Windows, macOS, and Linux.
     """
     connections = {
         "tcp": [],
@@ -98,85 +133,72 @@ def get_active_connections():
     }
 
     try:
-        # Use netstat (works on both macOS and Linux)
-        if platform.system() == "Darwin":
+        system = platform.system()
+        if system == "Windows":
+            cmd = ["netstat", "-ano"]
+        elif system == "Darwin":
             cmd = ["netstat", "-an", "-p", "tcp"]
-            cmd_udp = ["netstat", "-an", "-p", "udp"]
         else:
-            cmd = ["netstat", "-tuln"]
-            cmd_udp = None
+            cmd = ["netstat", "-tunap"]
 
-        # TCP connections
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        output = proc.stdout
 
-        tcp_pattern = re.compile(
-            r'(tcp[46]?)\s+\d+\s+\d+\s+'
-            r'([\d.*:]+\.(\d+))\s+'
-            r'([\d.*:]+\.(\d+))\s*'
-            r'(\S+)?'
+        # Generic pattern covering Windows / macOS / Linux netstat output
+        tcp_pat = re.compile(
+            r'(TCP|tcp[46]?)\s+'
+            r'([\d\[\].:*]+)[:\.](\d+)\s+'
+            r'([\d\[\].:*]+)[:\.](\d+)\s+'
+            r'(\S+)',
+            re.IGNORECASE,
+        )
+        udp_pat = re.compile(
+            r'(UDP|udp[46]?)\s+'
+            r'([\d\[\].:*]+)[:\.](\d+)\s+'
+            r'([\d\[\].:*]+)?[:\.]?(\d+)?',
+            re.IGNORECASE,
         )
 
-        for line in proc.stdout.split('\n'):
-            match = tcp_pattern.search(line)
-            if match:
-                proto = match.group(1)
-                local = match.group(2)
-                local_port = match.group(3)
-                remote = match.group(4)
-                remote_port = match.group(5)
-                state = match.group(6) or "UNKNOWN"
-
-                conn_entry = {
-                    "protocol": proto,
-                    "local_address": local,
-                    "local_port": int(local_port),
+        for line in output.splitlines():
+            m = tcp_pat.search(line)
+            if m:
+                state = m.group(6).upper()
+                remote = m.group(4)
+                connections["tcp"].append({
+                    "protocol": "tcp",
+                    "local_address": m.group(2),
+                    "local_port": int(m.group(3)),
                     "remote_address": remote,
-                    "remote_port": int(remote_port),
+                    "remote_port": int(m.group(5)),
                     "state": state,
-                }
-                connections["tcp"].append(conn_entry)
-
-                # Track states
+                })
                 connections["states"][state] = connections["states"].get(state, 0) + 1
+                if remote not in ("*", "0.0.0.0", "[::]", "127.0.0.1"):
+                    connections["top_remote_hosts"][remote] = (
+                        connections["top_remote_hosts"].get(remote, 0) + 1
+                    )
+                continue
 
-                # Track remote hosts
-                remote_host = remote.rsplit('.', 1)[0]
-                if remote_host != "*" and remote_host != "0.0.0.0" and remote_host != "127.0.0.1":
-                    connections["top_remote_hosts"][remote_host] = \
-                        connections["top_remote_hosts"].get(remote_host, 0) + 1
-
-        # UDP connections
-        if cmd_udp:
-            proc_udp = subprocess.run(cmd_udp, capture_output=True, text=True, timeout=15)
-            udp_pattern = re.compile(
-                r'(udp[46]?)\s+\d+\s+\d+\s+'
-                r'([\d.*:]+\.(\d+))\s+'
-                r'([\d.*:]+\.(\d+))?'
-            )
-            for line in proc_udp.stdout.split('\n'):
-                match = udp_pattern.search(line)
-                if match:
-                    conn_entry = {
-                        "protocol": match.group(1),
-                        "local_address": match.group(2),
-                        "local_port": int(match.group(3)),
-                        "remote_address": match.group(4) if match.group(4) else "*.*",
-                        "remote_port": int(match.group(5)) if match.group(5) else 0,
-                        "state": "STATELESS",
-                    }
-                    connections["udp"].append(conn_entry)
+            m = udp_pat.search(line)
+            if m and not tcp_pat.search(line):
+                connections["udp"].append({
+                    "protocol": "udp",
+                    "local_address": m.group(2),
+                    "local_port": int(m.group(3)),
+                    "remote_address": m.group(4) or "*",
+                    "remote_port": int(m.group(5)) if m.group(5) else 0,
+                    "state": "STATELESS",
+                })
 
         connections["tcp_count"] = len(connections["tcp"])
         connections["udp_count"] = len(connections["udp"])
-
-        # Sort top remote hosts
         connections["top_remote_hosts"] = dict(
             sorted(connections["top_remote_hosts"].items(),
                    key=lambda x: x[1], reverse=True)[:10]
         )
 
     except subprocess.TimeoutExpired:
-        connections["error"] = "Netstat timed out"
+        connections["error"] = "netstat timed out"
     except Exception as e:
         connections["error"] = str(e)
 
@@ -185,32 +207,24 @@ def get_active_connections():
 
 def measure_dns_resolution(hostname="google.com"):
     """Measure DNS resolution time."""
-    import socket
     try:
-        start = time.time()
+        start = time.perf_counter()
         socket.getaddrinfo(hostname, 80)
-        elapsed = (time.time() - start) * 1000  # ms
-        return {
-            "hostname": hostname,
-            "resolution_time_ms": round(elapsed, 2),
-            "error": None,
-        }
+        elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+        logger.debug("[PerfMonitor] DNS %s resolved in %.1f ms", hostname, elapsed_ms)
+        return {"hostname": hostname, "resolution_time_ms": elapsed_ms, "error": None}
     except socket.gaierror as e:
-        return {
-            "hostname": hostname,
-            "resolution_time_ms": None,
-            "error": f"DNS resolution failed: {e}",
-        }
+        return {"hostname": hostname, "resolution_time_ms": None, "error": f"DNS resolution failed: {e}"}
 
 
 def run_diagnostics(host="8.8.8.8", ping_count=10):
     """
-    Full performance diagnostic combining latency, connections,
-    and DNS resolution tests.
+    Full performance diagnostic: TCP latency + active connections + DNS.
+    `ping_count` controls how many TCP probe connections are made.
     """
-    latency = measure_latency(host, count=ping_count)
+    latency = measure_tcp_performance(host, count=ping_count)
     connections = get_active_connections()
-    dns = measure_dns_resolution()
+    dns = measure_dns_resolution(host if host != "8.8.8.8" else "google.com")
 
     return {
         "latency": latency,

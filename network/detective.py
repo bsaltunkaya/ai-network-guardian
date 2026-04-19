@@ -9,6 +9,10 @@ import subprocess
 import re
 import platform
 import socket
+import time
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 # Common MAC OUI prefixes -> vendor mapping
@@ -112,82 +116,8 @@ def estimate_device_type(vendor):
     return VENDOR_DEVICE_TYPES.get(vendor, "Unknown Device")
 
 
-def get_arp_table():
-    """Parse the system ARP table to find devices on the local network."""
-    devices = []
-    try:
-        result = subprocess.run(
-            ["arp", "-a"],
-            capture_output=True, text=True, timeout=10
-        )
-        # macOS format: hostname (IP) at MAC on interface [ethernet]
-        # Linux format: hostname (IP) at MAC [ether] on interface
-        pattern = re.compile(
-            r'\?\s+\((\d+\.\d+\.\d+\.\d+)\)\s+at\s+([\da-fA-F:]+)\s+on\s+(\w+)'
-        )
-        alt_pattern = re.compile(
-            r'(\S+)\s+\((\d+\.\d+\.\d+\.\d+)\)\s+at\s+([\da-fA-F:]+)'
-        )
-
-        for line in result.stdout.strip().split('\n'):
-            if not line.strip():
-                continue
-            match = pattern.search(line)
-            if match:
-                ip = match.group(1)
-                mac = match.group(2)
-                interface = match.group(3)
-            else:
-                match = alt_pattern.search(line)
-                if match:
-                    ip = match.group(2)
-                    mac = match.group(3)
-                    interface = "unknown"
-                else:
-                    continue
-
-            if mac == "(incomplete)" or mac == "ff:ff:ff:ff:ff:ff":
-                continue
-
-            vendor = lookup_mac_vendor(mac)
-            device_type = estimate_device_type(vendor)
-
-            try:
-                hostname = socket.gethostbyaddr(ip)[0]
-            except (socket.herror, socket.timeout):
-                hostname = None
-
-            devices.append({
-                "ip": ip,
-                "mac": mac,
-                "vendor": vendor,
-                "device_type": device_type,
-                "interface": interface,
-                "hostname": hostname,
-                "is_responsive": None,  # will be filled by ping
-            })
-    except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
-        return {"error": str(e), "devices": []}
-
-    return devices
-
-
-def ping_host(ip, count=1, timeout=2):
-    """Ping a single host and return True if responsive."""
-    try:
-        flag = "-c" if platform.system() != "Windows" else "-n"
-        timeout_flag = "-W" if platform.system() != "Windows" else "-w"
-        result = subprocess.run(
-            ["ping", flag, str(count), timeout_flag, str(timeout * 1000 if platform.system() == "Windows" else timeout), ip],
-            capture_output=True, text=True, timeout=timeout + 3
-        )
-        return result.returncode == 0
-    except (subprocess.TimeoutExpired, Exception):
-        return False
-
-
 def get_local_ip_range():
-    """Detect the local network IP range."""
+    """Detect the local IP and subnet prefix."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -199,36 +129,271 @@ def get_local_ip_range():
         return "192.168.1", "192.168.1.1"
 
 
+def _should_skip_ip(ip: str, local_ip: str) -> bool:
+    """Return True for IPs that should be excluded from results."""
+    if ip == local_ip:
+        return True
+    parts = ip.split('.')
+    if len(parts) != 4:
+        return True
+    last = int(parts[3])
+    first = int(parts[0])
+    # Broadcast (.255), multicast (224-239), loopback (127)
+    if last == 255 or first == 127:
+        return True
+    if 224 <= first <= 239:
+        return True
+    return False
+
+
+def get_arp_table(local_ip: str = ""):
+    """
+    Parse `arp -a` output on Windows, macOS, and Linux.
+
+    Windows format:
+        Interface: 10.65.233.85 --- 0x8
+          Internet Address      Physical Address      Type
+          10.65.233.144         0a-6c-44-f6-ef-dc     dynamic
+
+    macOS/Linux format:
+        ? (192.168.1.1) at aa:bb:cc:dd:ee:ff on en0
+    """
+    devices = []
+    try:
+        result = subprocess.run(
+            ["arp", "-a"], capture_output=True, timeout=10,
+            # Use cp1252/utf-8 with errors='replace' to survive any encoding
+            text=True, encoding="utf-8", errors="replace",
+        )
+        output = result.stdout
+        logger.debug("[ARP] raw output (%d lines):\n%s", len(output.splitlines()), output[:800])
+
+        is_windows = platform.system() == "Windows"
+
+        # Windows:  "  10.65.233.144         0a-6c-44-f6-ef-dc     dynamic"
+        win_pattern = re.compile(
+            r'^\s*([\d.]+)\s+([\da-fA-F][\da-fA-F-]{16,})\s+(dynamic|static)',
+            re.IGNORECASE,
+        )
+        # macOS/Linux: "? (192.168.1.1) at aa:bb:cc:dd:ee:ff on en0"
+        unix_pattern = re.compile(
+            r'\((\d+\.\d+\.\d+\.\d+)\)\s+at\s+([\da-fA-F:]+)',
+            re.IGNORECASE,
+        )
+
+        current_interface = "unknown"
+        iface_pattern = re.compile(r'Interface:\s*([\d.]+)', re.IGNORECASE)
+
+        for line in output.splitlines():
+            # Track current interface on Windows
+            iface_match = iface_pattern.search(line)
+            if iface_match:
+                current_interface = iface_match.group(1)
+                continue
+
+            if is_windows:
+                m = win_pattern.match(line)
+                if not m:
+                    continue
+                ip  = m.group(1)
+                mac = m.group(2).replace("-", ":").upper()
+            else:
+                m = unix_pattern.search(line)
+                if not m:
+                    continue
+                ip  = m.group(1)
+                mac = m.group(2).upper()
+                if mac in ("FF:FF:FF:FF:FF:FF", "(INCOMPLETE)"):
+                    continue
+
+            if _should_skip_ip(ip, local_ip):
+                logger.debug("[ARP] skipped %s", ip)
+                continue
+
+            vendor      = lookup_mac_vendor(mac)
+            device_type = estimate_device_type(vendor)
+
+            try:
+                hostname = socket.gethostbyaddr(ip)[0]
+            except Exception:
+                hostname = None
+
+            devices.append({
+                "ip": ip,
+                "mac": mac,
+                "vendor": vendor,
+                "device_type": device_type,
+                "interface": current_interface,
+                "hostname": hostname,
+                "is_responsive": None,
+            })
+            logger.debug("[ARP] found  %s  mac=%s  vendor=%s", ip, mac, vendor)
+
+    except subprocess.TimeoutExpired:
+        return {"error": "arp -a timed out", "devices": []}
+    except FileNotFoundError:
+        return {"error": "arp command not found", "devices": []}
+    except Exception as e:
+        return {"error": str(e), "devices": []}
+
+    logger.debug("[ARP] total parsed: %d devices", len(devices))
+    return devices
+
+
+def ping_host(ip: str, count: int = 1, timeout: int = 2) -> bool:
+    """Ping a host; returns True if reachable."""
+    try:
+        if platform.system() == "Windows":
+            cmd = ["ping", "-n", str(count), "-w", str(timeout * 1000), ip]
+        else:
+            cmd = ["ping", "-c", str(count), "-W", str(timeout), ip]
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout + 5)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def test_tcp_connection(ip: str, port: int, timeout: int = 5) -> dict:
+    """
+    Attempt a TCP connection to ip:port and return a Layer 1-4 analysis.
+
+    Status values:
+        connected   — SYN-ACK received, port is open
+        refused     — RST received, port is closed but host is up
+        timeout     — No response; likely filtered by firewall
+        unreachable — No route to host; L3 routing failure
+        error       — Unexpected OS error
+    """
+    result = {
+        "target": {"ip": ip, "port": port, "timeout": timeout},
+        "status": None,
+        "latency_ms": None,
+        "layer_analysis": {
+            "L1_physical":  None,
+            "L2_datalink":  None,
+            "L3_network":   None,
+            "L4_transport": None,
+        },
+        "error": None,
+    }
+
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        t0 = time.perf_counter()
+        sock.connect((ip, port))
+        latency_ms = round((time.perf_counter() - t0) * 1000, 3)
+        sock.close()
+
+        result["status"] = "connected"
+        result["latency_ms"] = latency_ms
+        result["layer_analysis"] = {
+            "L1_physical":  "OK — Physical link active (full handshake completed)",
+            "L2_datalink":  "OK — MAC/ARP resolved, frames delivered",
+            "L3_network":   "OK — IP routing functional, packets delivered",
+            "L4_transport": f"OPEN — TCP port {port} accepted the connection ({latency_ms} ms RTT)",
+        }
+
+    except ConnectionRefusedError:
+        result["status"] = "refused"
+        result["layer_analysis"] = {
+            "L1_physical":  "OK — Physical link active (RST packet received)",
+            "L2_datalink":  "OK — MAC/ARP resolved, host reachable",
+            "L3_network":   "OK — IP routing functional, host responded",
+            "L4_transport": f"CLOSED — Port {port} sent TCP RST; no service is listening on this port",
+        }
+
+    except (socket.timeout, TimeoutError):
+        result["status"] = "timeout"
+        result["layer_analysis"] = {
+            "L1_physical":  "UNKNOWN — Cannot confirm physical link",
+            "L2_datalink":  "UNKNOWN — ARP reachability unclear",
+            "L3_network":   "SUSPECT — Packets may be dropped by router or firewall",
+            "L4_transport": f"FILTERED — Port {port} did not respond within {timeout}s; likely blocked by firewall",
+        }
+
+    except OSError as e:
+        err_lower = str(e).lower()
+        if any(x in err_lower for x in ["unreachable", "no route", "network is unreachable", "10065", "10051"]):
+            result["status"] = "unreachable"
+            result["layer_analysis"] = {
+                "L1_physical":  "UNKNOWN — Physical layer status unconfirmed",
+                "L2_datalink":  "FAIL — Cannot resolve MAC address; host may be offline or on different subnet",
+                "L3_network":   f"FAIL — No route to {ip}; routing table has no path to this host",
+                "L4_transport": "N/A — Transport layer unreachable (L3 failure blocks L4)",
+            }
+        else:
+            result["status"] = "error"
+            result["error"] = str(e)
+            result["layer_analysis"] = {
+                "L1_physical":  "UNKNOWN",
+                "L2_datalink":  "UNKNOWN",
+                "L3_network":   "UNKNOWN",
+                "L4_transport": f"ERROR — {e}",
+            }
+
+    logger.debug(
+        "[ConnTest] %s:%d => %s  latency=%s ms  error=%s",
+        ip, port, result["status"], result["latency_ms"], result["error"],
+    )
+    return result
+
+
+def _detect_gateway(subnet: str, devices: list):
+    """
+    Best-effort gateway detection:
+    1. <subnet>.1  (most common home/office gateway)
+    2. <subnet>.254 (common on some ISPs)
+    3. First device in the ARP table
+    """
+    for suffix in ("1", "254"):
+        candidate = f"{subnet}.{suffix}"
+        if any(d["ip"] == candidate for d in devices):
+            return candidate
+    return devices[0]["ip"] if devices else None
+
+
 def scan_network():
     """
-    Full network scan combining ARP table with ping verification.
-    Returns structured device list with vendor and type info.
+    Full network scan: reads ARP table, filters noise, pings each host,
+    detects gateway, and returns structured device list.
     """
-    raw = get_arp_table()
+    subnet, local_ip = get_local_ip_range()
+    logger.debug("[Scan] local_ip=%s  subnet=%s", local_ip, subnet)
+
+    raw = get_arp_table(local_ip=local_ip)
     if isinstance(raw, dict) and "error" in raw:
-        # Return a properly structured response even on error
-        subnet, local_ip = get_local_ip_range()
+        logger.warning("[Scan] ARP error: %s", raw["error"])
         return {
-            "devices": raw.get("devices", []),
+            "devices": [],
             "total_found": 0,
             "responsive": 0,
             "unknown_count": 0,
             "subnet": subnet,
             "local_ip": local_ip,
+            "gateway": None,
             "gateway_candidates": [],
             "warning": raw["error"],
         }
     devices = raw
+    logger.debug("[Scan] ARP returned %d devices before ping", len(devices))
 
-    subnet, local_ip = get_local_ip_range()
-
-    # Ping verify each discovered device (limited to keep it fast)
-    for device in devices[:30]:  # cap at 30 to avoid long scans
+    # Ping verify each device (cap at 30 to stay fast)
+    for device in devices[:30]:
         device["is_responsive"] = ping_host(device["ip"])
+        logger.debug("[Scan] ping %s => %s", device["ip"], device["is_responsive"])
 
-    # Classify devices
-    gateway_candidates = [d for d in devices if d["ip"].endswith(".1")]
-    unknown_devices = [d for d in devices if d["vendor"] == "Unknown Vendor"]
+    gateway = _detect_gateway(subnet, devices)
+    gateway_candidates = [d["ip"] for d in devices if d["ip"].endswith(".1") or d["ip"].endswith(".254")]
+    unknown_devices    = [d for d in devices if d["vendor"] == "Unknown Vendor"]
+
+    logger.debug(
+        "[Scan] done — total=%d  responsive=%d  unknown=%d  gateway=%s",
+        len(devices),
+        sum(1 for d in devices if d.get("is_responsive")),
+        len(unknown_devices),
+        gateway,
+    )
 
     return {
         "devices": devices,
@@ -237,5 +402,6 @@ def scan_network():
         "unknown_count": len(unknown_devices),
         "subnet": subnet,
         "local_ip": local_ip,
-        "gateway_candidates": [d["ip"] for d in gateway_candidates],
+        "gateway": gateway,
+        "gateway_candidates": gateway_candidates,
     }

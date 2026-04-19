@@ -75,6 +75,12 @@ Network scan data:
 Focus on: certificate validity and trust chain, domain age and registration patterns,
 phishing risk signals, TLS version strength, and overall website trustworthiness.
 
+IMPORTANT WHOIS RULES you must apply:
+- If whois_quality.all_fields_missing is true: set confidence <= 0.50 for all WHOIS-related diagnoses and explicitly mention reduced confidence
+- If domain_age_days < 365 (1 year): include a warning about the young domain age
+- If whois_quality.registrar_missing is true: flag the domain as suspicious due to missing registrar
+- If whois_quality.note is present: include it verbatim in the relevant diagnosis explanation
+
 Security analysis data:
 """,
     "performance": """Analyze this NETWORK PERFORMANCE diagnostic data. The measurements include:
@@ -86,6 +92,26 @@ Focus on: latency quality for real-time use, packet loss impact, jitter stabilit
 connection count health, unusual connection states, DNS speed, and overall performance.
 
 Performance diagnostic data:
+""",
+    "connection": """Analyze this TCP CONNECTION TEST result. The test attempted a direct TCP socket
+connection to a specific IP:port and recorded the outcome at each network layer.
+
+Status meanings:
+- connected:   L1-L4 all functional; port is open and accepting connections
+- refused:     L1-L3 OK; port is CLOSED (TCP RST received) — no service listening
+- timeout:     L4 filtered; firewall is silently dropping packets to this port
+- unreachable: L3 failure; no route to host, host offline, or wrong subnet
+
+Layer analysis fields:
+- L1_physical:  Physical link status (inferred)
+- L2_datalink:  MAC/ARP reachability (Data Link layer)
+- L3_network:   IP routing result (Network layer)
+- L4_transport: TCP port status (Transport layer)
+
+Focus on: what each layer result implies, root cause of failure, whether this is a
+firewall/routing/application issue, and concrete steps to resolve it.
+
+Connection test data:
 """,
 }
 
@@ -250,8 +276,34 @@ class RuleBasedFallback:
                 recommendation="Avoid sensitive data entry until the certificate is renewed.",
             ))
 
+        whois_quality = security_data.get("whois_quality", {})
+        confidence_modifier = whois_quality.get("confidence_modifier", 1.0)
+
         risk_score = phishing.get("risk_score", 0)
         risk_level = phishing.get("risk_level", "safe")
+
+        if whois_quality.get("all_fields_missing"):
+            diagnoses.append(Diagnosis(
+                title="WHOIS Data Unavailable — Reduced Confidence",
+                layer="Application",
+                confidence=0.50,
+                severity="medium",
+                evidence=["All WHOIS fields returned N/A", "Domain may use a privacy proxy or WHOIS is restricted"],
+                explanation=f"No WHOIS data could be retrieved for {hostname}. Domain ownership, registration date, and registrar are all unknown. Confidence in this analysis is reduced to 50%.",
+                recommendation="Treat this domain with caution. Verify the site through other means before entering sensitive information.",
+            ))
+
+        if whois_quality.get("registrar_missing") and not whois_quality.get("all_fields_missing"):
+            diagnoses.append(Diagnosis(
+                title="Registrar Information Missing",
+                layer="Application",
+                confidence=round(0.70 * confidence_modifier, 2),
+                severity="low",
+                evidence=["Registrar field is empty in WHOIS data"],
+                explanation=f"The registrar for {hostname} is not listed in WHOIS records. This may indicate a privacy shield service or incomplete registration data.",
+                recommendation="Verify domain ownership through alternative sources.",
+            ))
+
         if risk_score >= 30:
             indicators = [i for i in phishing.get("indicators", []) if i.get("weight", 0) > 0]
             severity = "critical" if risk_score >= 70 else ("high" if risk_score >= 50 else "medium")
@@ -356,6 +408,87 @@ class RuleBasedFallback:
 
         return [d.to_dict() for d in diagnoses]
 
+    def analyze_connection_test(self, conn_data):
+        diagnoses = []
+        target  = conn_data.get("target", {})
+        ip      = target.get("ip", "?")
+        port    = target.get("port", "?")
+        status  = conn_data.get("status", "error")
+        latency = conn_data.get("latency_ms")
+        layers  = conn_data.get("layer_analysis", {})
+
+        if status == "connected":
+            sev = "info" if (latency or 0) < 100 else "low"
+            diagnoses.append(Diagnosis(
+                title=f"Port {port} Open — Connection Successful",
+                layer="Transport", confidence=0.99, severity=sev,
+                evidence=[
+                    f"TCP handshake completed in {latency} ms",
+                    f"L3: {layers.get('L3_network', 'OK')}",
+                    f"L4: {layers.get('L4_transport', 'OPEN')}",
+                ],
+                explanation=f"TCP connection to {ip}:{port} succeeded at the Transport layer. All layers L1–L4 are functional.",
+                recommendation="Service is reachable. If unexpected, verify whether this port should be publicly accessible.",
+            ))
+            if latency and latency > 200:
+                diagnoses.append(Diagnosis(
+                    title="High Connection Latency",
+                    layer="Network", confidence=0.80, severity="medium",
+                    evidence=[f"RTT: {latency} ms"],
+                    explanation=f"Connection succeeded but RTT of {latency} ms is high. Network layer routing may be suboptimal.",
+                    recommendation="Check routing path, consider CDN or closer server.",
+                ))
+
+        elif status == "refused":
+            diagnoses.append(Diagnosis(
+                title=f"Port {port} Closed — Connection Refused",
+                layer="Transport", confidence=0.97, severity="medium",
+                evidence=[
+                    "TCP RST packet received",
+                    f"L3: {layers.get('L3_network', 'OK')}",
+                    f"L4: {layers.get('L4_transport', 'CLOSED')}",
+                ],
+                explanation=f"Host {ip} is reachable at L1–L3 but port {port} is CLOSED at the Transport layer. No service is listening on this port.",
+                recommendation=f"Verify the service is running on {ip}. Check if the correct port number is being used.",
+            ))
+
+        elif status == "timeout":
+            diagnoses.append(Diagnosis(
+                title=f"Port {port} Filtered — Connection Timed Out",
+                layer="Transport", confidence=0.85, severity="high",
+                evidence=[
+                    "No TCP response received within timeout",
+                    f"L3: {layers.get('L3_network', 'SUSPECT')}",
+                    f"L4: {layers.get('L4_transport', 'FILTERED')}",
+                ],
+                explanation=f"TCP SYN packets to {ip}:{port} received no response. A firewall is silently dropping packets at the Network or Transport layer.",
+                recommendation=f"Check firewall rules on {ip} and any intermediate routers. Add an inbound rule for port {port} if the service should be accessible.",
+            ))
+
+        elif status == "unreachable":
+            diagnoses.append(Diagnosis(
+                title=f"Host Unreachable — L3 Routing Failure",
+                layer="Network", confidence=0.90, severity="high",
+                evidence=[
+                    f"No route to {ip}",
+                    f"L2: {layers.get('L2_datalink', 'FAIL')}",
+                    f"L3: {layers.get('L3_network', 'FAIL')}",
+                ],
+                explanation=f"The host {ip} cannot be reached at the Network layer. The routing table has no path to this address, or the host is offline.",
+                recommendation="Verify the IP address is correct. Check if the host is powered on and connected. Confirm you are on the correct network/subnet.",
+            ))
+
+        else:
+            diagnoses.append(Diagnosis(
+                title="Connection Test Error",
+                layer="Network", confidence=0.60, severity="medium",
+                evidence=[conn_data.get("error", "Unknown error")],
+                explanation="An unexpected error occurred during the TCP connection test.",
+                recommendation="Verify the IP address format and try again.",
+            ))
+
+        return [d.to_dict() for d in diagnoses]
+
 
 # ──────────────────────────────────────────────────────────────
 #  Main Engine (API-first with rule-based fallback)
@@ -389,6 +522,9 @@ class AIReasoningCore:
 
     def analyze_performance(self, perf_data):
         return self._analyze("performance", perf_data, _fallback.analyze_performance)
+
+    def analyze_connection_test(self, conn_data):
+        return self._analyze("connection", conn_data, _fallback.analyze_connection_test)
 
     def get_mode(self):
         """Return current reasoning mode for UI display."""

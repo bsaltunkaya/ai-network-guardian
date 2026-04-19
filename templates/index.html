@@ -35,6 +35,11 @@
             Performance Monitor
             <span class="tab-layer">L3/L4</span>
         </button>
+        <button class="tab-btn" data-tab="conntest">
+            <span class="tab-icon">&#128268;</span>
+            Connection Test
+            <span class="tab-layer">L1-L4</span>
+        </button>
     </nav>
 
     <!-- Main Content -->
@@ -106,6 +111,47 @@
                 <p>Running performance diagnostics...</p>
             </div>
             <div id="performance-results" class="results-area"></div>
+        </section>
+
+        <!-- Connection Test Module -->
+        <section id="tab-conntest" class="tab-content">
+            <div class="module-header">
+                <h2>Connection Test</h2>
+                <p>Test TCP connectivity to any IP address and port. Analyzes all four network layers (L1–L4) and provides AI-powered diagnosis.</p>
+            </div>
+            <div class="action-bar">
+                <div class="input-group">
+                    <input type="text" id="conn-ip" placeholder="IP Address (e.g. 192.168.1.1)"
+                           onkeydown="if(event.key==='Enter')runConnectionTest()">
+                    <input type="number" id="conn-port" placeholder="Port" value="80" min="1" max="65535"
+                           style="width:100px" onkeydown="if(event.key==='Enter')runConnectionTest()">
+                    <label class="ping-count-label">
+                        Timeout (s):
+                        <input type="number" id="conn-timeout" value="5" min="1" max="15" style="width:55px">
+                    </label>
+                    <button class="btn-primary" onclick="runConnectionTest()">Test Connection</button>
+                </div>
+                <button class="btn-secondary" onclick="loadHistory('connection')">View History</button>
+            </div>
+
+            <!-- Quick port presets -->
+            <div class="port-presets">
+                <span class="preset-label">Quick presets:</span>
+                <button class="preset-btn" onclick="setPort(80)">HTTP 80</button>
+                <button class="preset-btn" onclick="setPort(443)">HTTPS 443</button>
+                <button class="preset-btn" onclick="setPort(22)">SSH 22</button>
+                <button class="preset-btn" onclick="setPort(3389)">RDP 3389</button>
+                <button class="preset-btn" onclick="setPort(3306)">MySQL 3306</button>
+                <button class="preset-btn" onclick="setPort(5432)">PostgreSQL 5432</button>
+                <button class="preset-btn" onclick="setPort(6379)">Redis 6379</button>
+                <button class="preset-btn" onclick="setPort(8080)">HTTP-alt 8080</button>
+            </div>
+
+            <div id="conntest-loading" class="loading hidden">
+                <div class="spinner"></div>
+                <p>Testing TCP connection...</p>
+            </div>
+            <div id="conntest-results" class="results-area"></div>
         </section>
     </main>
 

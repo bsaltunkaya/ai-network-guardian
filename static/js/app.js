@@ -176,6 +176,12 @@ async function runDetectiveScan() {
 // Security Hunter
 // ============================================
 
+function getOverallVerdict(score) {
+    if (score <= 30) return { label: 'SAFE',      cls: 'safe',      icon: '✔',  desc: 'No significant threats detected.' };
+    if (score <= 60) return { label: 'CAUTION',   cls: 'caution',   icon: '⚠',  desc: 'Some risk factors present. Proceed carefully.' };
+    return             { label: 'DANGEROUS', cls: 'dangerous', icon: '✖',  desc: 'Multiple threats detected. Avoid this site.' };
+}
+
 async function runSecurityAnalysis() {
     const urlInput = document.getElementById('url-input');
     const url = urlInput.value.trim();
@@ -206,17 +212,31 @@ async function runSecurityAnalysis() {
         const phishing = analysis.phishing_assessment || {};
         const urlInfo = analysis.url || {};
 
-        // Risk meter
         const riskScore = phishing.risk_score || 0;
         const riskLevel = phishing.risk_level || 'safe';
+        const verdict = getOverallVerdict(riskScore);
+
         let html = `
+        <div class="overall-risk-score ${verdict.cls}">
+            <div class="ors-icon">${verdict.icon}</div>
+            <div class="ors-body">
+                <div class="ors-label">${verdict.label}</div>
+                <div class="ors-desc">${verdict.desc}</div>
+            </div>
+            <div class="ors-score">${riskScore}<span>/100</span></div>
+        </div>
         <div class="risk-meter">
             <div class="risk-label">
-                <span>Phishing Risk Assessment</span>
-                <span><strong>${riskScore}/100</strong> (${riskLevel.toUpperCase()})</span>
+                <span>Overall Risk Score</span>
+                <span style="font-size:0.75rem;color:var(--text-muted)">SAFE 0–30 &nbsp;|&nbsp; CAUTION 31–60 &nbsp;|&nbsp; DANGEROUS 61–100</span>
             </div>
             <div class="risk-bar-container">
-                <div class="risk-bar ${riskLevel}" style="width:${Math.max(riskScore, 3)}%"></div>
+                <div class="risk-bar-track">
+                    <div class="risk-bar-safe"></div>
+                    <div class="risk-bar-caution"></div>
+                    <div class="risk-bar-dangerous"></div>
+                </div>
+                <div class="risk-bar-needle" style="left:${riskScore}%"></div>
             </div>
         </div>`;
 
@@ -388,6 +408,100 @@ async function runPerformanceDiag() {
     } catch (err) {
         hideLoading('performance');
         showError('performance', err.message);
+    }
+}
+
+
+// ============================================
+// Connection Test
+// ============================================
+
+function setPort(port) {
+    document.getElementById('conn-port').value = port;
+}
+
+const CONN_STATUS_META = {
+    connected:   { label: 'CONNECTED',   cls: 'connected',   icon: '✔', desc: 'TCP handshake completed successfully.' },
+    refused:     { label: 'REFUSED',     cls: 'refused',     icon: '✖', desc: 'Port is closed — TCP RST received.' },
+    timeout:     { label: 'TIMEOUT',     cls: 'timeout',     icon: '⏱', desc: 'No response — port is likely filtered by firewall.' },
+    unreachable: { label: 'UNREACHABLE', cls: 'unreachable', icon: '⊘', desc: 'Host unreachable — L3 routing failure.' },
+    error:       { label: 'ERROR',       cls: 'refused',     icon: '!', desc: 'Unexpected error during connection test.' },
+};
+
+async function runConnectionTest() {
+    const ip      = document.getElementById('conn-ip').value.trim();
+    const port    = parseInt(document.getElementById('conn-port').value);
+    const timeout = parseInt(document.getElementById('conn-timeout').value) || 5;
+
+    if (!ip) { document.getElementById('conn-ip').focus(); return; }
+    if (!port || port < 1 || port > 65535) { document.getElementById('conn-port').focus(); return; }
+
+    showLoading('conntest');
+
+    try {
+        const res = await fetch('/api/detective/connect', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ip, port, timeout }),
+        });
+        const data = await res.json();
+        hideLoading('conntest');
+
+        if (data.error) { showError('conntest', data.error); return; }
+
+        const conn   = data.connection;
+        const target = conn.target || {};
+        const status = conn.status || 'error';
+        const layers = conn.layer_analysis || {};
+        const meta   = CONN_STATUS_META[status] || CONN_STATUS_META.error;
+
+        // Status banner
+        let html = `
+        <div class="conn-status-banner ${meta.cls}">
+            <div class="csb-icon">${meta.icon}</div>
+            <div class="csb-body">
+                <div class="csb-label">${meta.label}</div>
+                <div class="csb-target">${escapeHtml(target.ip)}:${target.port}</div>
+                <div class="csb-desc">${meta.desc}</div>
+            </div>
+            ${conn.latency_ms !== null && conn.latency_ms !== undefined
+                ? `<div class="csb-latency">${conn.latency_ms}<span>ms</span></div>`
+                : ''}
+        </div>`;
+
+        // Layer analysis table
+        const layerRows = [
+            { key: 'L1_physical',  label: 'L1 Physical',  color: 'var(--layer-datalink)' },
+            { key: 'L2_datalink',  label: 'L2 Data Link', color: 'var(--layer-datalink)' },
+            { key: 'L3_network',   label: 'L3 Network',   color: 'var(--layer-network)' },
+            { key: 'L4_transport', label: 'L4 Transport', color: 'var(--layer-transport)' },
+        ];
+
+        html += `<div class="section-title" style="margin-top:1rem">Layer Analysis</div>
+        <div class="layer-analysis-grid">`;
+        for (const row of layerRows) {
+            const val   = layers[row.key] || 'N/A';
+            const isOk  = val.startsWith('OK');
+            const isFail = val.startsWith('FAIL') || val.startsWith('CLOSED') || val.startsWith('FILTERED');
+            const dot   = isOk ? '●' : isFail ? '●' : '◐';
+            const dotCls = isOk ? 'dot-ok' : isFail ? 'dot-fail' : 'dot-warn';
+            html += `
+            <div class="layer-row">
+                <span class="layer-badge" style="background:${row.color}22;color:${row.color}">${row.label}</span>
+                <span class="layer-dot ${dotCls}">${dot}</span>
+                <span class="layer-detail">${escapeHtml(val)}</span>
+            </div>`;
+        }
+        html += `</div>`;
+
+        // AI Diagnosis
+        html += `<div class="section-title" style="margin-top:1rem">AI Diagnosis</div>`;
+        html += renderDiagnoses(data.diagnoses);
+
+        document.getElementById('conntest-results').innerHTML = html;
+    } catch (err) {
+        hideLoading('conntest');
+        showError('conntest', err.message);
     }
 }
 
