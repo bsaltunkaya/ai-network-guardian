@@ -6,10 +6,14 @@ Falls back to a rule-based engine if no API key is configured.
 """
 
 import json
+import logging
 import os
+import re
 import urllib.request
 import urllib.error
 from dataclasses import dataclass, asdict
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -75,11 +79,30 @@ Network scan data:
 Focus on: certificate validity and trust chain, domain age and registration patterns,
 phishing risk signals, TLS version strength, and overall website trustworthiness.
 
-IMPORTANT WHOIS RULES you must apply:
+IMPORTANT RULES you must apply:
+
+WHOIS rules:
 - If whois_quality.all_fields_missing is true: set confidence <= 0.50 for all WHOIS-related diagnoses and explicitly mention reduced confidence
 - If domain_age_days < 365 (1 year): include a warning about the young domain age
 - If whois_quality.registrar_missing is true: flag the domain as suspicious due to missing registrar
 - If whois_quality.note is present: include it verbatim in the relevant diagnosis explanation
+
+Institutional domain rules (domains ending in .edu.*, .gov.*, .mil.*, .ac.*):
+- These are government-controlled TLDs and should be treated with higher trust
+- Wildcard certificates are NORMAL for institutional domains -- do NOT flag them
+- Missing WHOIS data is NORMAL for institutional domains (restricted by policy) -- do NOT penalize
+- Government CAs like TUBITAK, HARICA, CFCA, SECOM are legitimate national certificate authorities -- treat them as trusted, not "uncommon"
+
+Phishing detection rules:
+- High-threat keywords in domain names (phishing, malware, hack, spoof, fraud, scam) are strong risk signals even if the cert is valid and domain is old
+- Wildcard cert + free CA (Let's Encrypt) + suspicious keywords = phishing infrastructure pattern
+- A suspicious subdomain on an unrelated parent domain (e.g. "login.randomsite.com") is a strong impersonation signal
+- Positive indicators (valid cert, old domain) should NEVER fully override active risk signals
+
+Always respect the pre-computed risk_score in phishing_assessment -- your severity should align with it.
+
+IMPORTANT -- Website context diagnosis:
+You MUST include ONE extra diagnosis with title "Website Overview" (severity "info", layer "Application") that describes what this website likely IS and DOES based on the domain name, certificate subject/organization, WHOIS registrant, and any other clues in the data. Write it like a human would explain it to a friend, e.g. "This looks like a university website for Gebze Technical University in Turkey" or "This appears to be a phishing test page hosted on a DNS filtering service." Be specific and natural. If you cannot determine the purpose, say so honestly.
 
 Security analysis data:
 """,
@@ -120,11 +143,13 @@ Connection test data:
 #  Gemini API (plain HTTP, no SDK)
 # ──────────────────────────────────────────────────────────────
 
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-pro"]
 
 
 def _call_gemini(module, data):
-    """POST to Gemini REST API. Returns list of dicts or None on failure."""
+    """POST to Gemini REST API. Tries Flash first, falls back to Pro on 429."""
+    import time as _time
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         return None
@@ -139,42 +164,53 @@ def _call_gemini(module, data):
         "contents": [{"parts": [{"text": prompt}]}]
     }).encode()
 
-    req = urllib.request.Request(
-        f"{GEMINI_URL}?key={api_key}",
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+    for model in GEMINI_MODELS:
+        url = f"{GEMINI_BASE}/{model}:generateContent?key={api_key}"
+        try:
+            logger.debug("[Gemini] trying %s for module=%s", model, module)
+            req = urllib.request.Request(
+                url, data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = json.loads(resp.read())
 
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            result = json.loads(resp.read())
+            text = result["candidates"][0]["content"]["parts"][0]["text"].strip()
 
-        text = result["candidates"][0]["content"]["parts"][0]["text"].strip()
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+            if text.endswith("```"):
+                text = text[:-3]
+            text = text.strip()
 
-        # Strip markdown fences
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
+            diagnoses = json.loads(text)
+            if not isinstance(diagnoses, list):
+                return None
 
-        diagnoses = json.loads(text)
-        if not isinstance(diagnoses, list):
+            required_keys = {"title", "layer", "confidence", "severity", "evidence", "explanation", "recommendation"}
+            valid = []
+            for d in diagnoses:
+                if isinstance(d, dict) and required_keys.issubset(d.keys()):
+                    d["confidence"] = float(d["confidence"])
+                    if not isinstance(d["evidence"], list):
+                        d["evidence"] = [str(d["evidence"])]
+                    valid.append(d)
+            logger.debug("[Gemini] %s succeeded for module=%s", model, module)
+            return valid if valid else None
+
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                logger.warning("[Gemini] %s rate limited, trying next model...", model)
+                continue
+            logger.warning("[Gemini] %s failed: %s", model, e)
+            return None
+        except Exception as e:
+            logger.warning("[Gemini] %s failed: %s", model, e)
             return None
 
-        required_keys = {"title", "layer", "confidence", "severity", "evidence", "explanation", "recommendation"}
-        valid = []
-        for d in diagnoses:
-            if isinstance(d, dict) and required_keys.issubset(d.keys()):
-                d["confidence"] = float(d["confidence"])
-                if not isinstance(d["evidence"], list):
-                    d["evidence"] = [str(d["evidence"])]
-                valid.append(d)
-        return valid if valid else None
-
-    except Exception:
-        return None
+    logger.warning("[Gemini] all models rate limited, falling back to rules")
+    return None
 
 
 # ──────────────────────────────────────────────────────────────
@@ -282,7 +318,11 @@ class RuleBasedFallback:
         risk_score = phishing.get("risk_score", 0)
         risk_level = phishing.get("risk_level", "safe")
 
-        if whois_quality.get("all_fields_missing"):
+        is_institutional = bool(re.search(
+            r'\.(edu|gov|mil|ac|k12)(\.[a-z]{2,3})?$', hostname.lower()
+        ))
+
+        if whois_quality.get("all_fields_missing") and not is_institutional:
             diagnoses.append(Diagnosis(
                 title="WHOIS Data Unavailable — Reduced Confidence",
                 layer="Application",
@@ -304,15 +344,24 @@ class RuleBasedFallback:
                 recommendation="Verify domain ownership through alternative sources.",
             ))
 
+        risk_indicators = [i for i in phishing.get("indicators", []) if i.get("weight", 0) > 0]
+
         if risk_score >= 30:
-            indicators = [i for i in phishing.get("indicators", []) if i.get("weight", 0) > 0]
             severity = "critical" if risk_score >= 70 else ("high" if risk_score >= 50 else "medium")
             diagnoses.append(Diagnosis(
                 title=f"Phishing Risk Detected ({risk_level.title()})", layer="Application",
-                confidence=0.75, severity=severity,
-                evidence=[f"Risk score: {risk_score}/100"] + [i["signal"] for i in indicators[:3]],
+                confidence=min(0.60 + risk_score * 0.004, 0.95), severity=severity,
+                evidence=[f"Risk score: {risk_score}/100"] + [i["signal"] for i in risk_indicators[:5]],
                 explanation=f"Multiple signals indicate {hostname} may be malicious. Score: {risk_score}/100 from certificate, domain, and WHOIS analysis at the Application layer.",
                 recommendation="Do not enter passwords or personal information. Verify the URL carefully.",
+            ))
+        elif risk_score >= 10:
+            diagnoses.append(Diagnosis(
+                title=f"Minor Risk Signals Detected", layer="Application",
+                confidence=0.60, severity="low",
+                evidence=[f"Risk score: {risk_score}/100"] + [i["signal"] for i in risk_indicators[:3]],
+                explanation=f"Some risk signals were found for {hostname} but the overall score is low. Exercise normal caution.",
+                recommendation="Probably safe, but verify the URL if anything looks unusual.",
             ))
 
         if risk_score < 10 and cert.get("valid") and not cert.get("is_expired"):
@@ -324,7 +373,7 @@ class RuleBasedFallback:
                     f"Risk score: {risk_score}/100",
                     f"TLS: {cert.get('protocol_version', 'N/A')}",
                 ],
-                explanation=f"{hostname} has a valid certificate, low phishing risk, and proper HTTPS at the Application layer.",
+                explanation=f"{hostname} has a valid certificate, zero risk signals, and proper HTTPS at the Application layer.",
                 recommendation="Site appears safe. Stay vigilant for unexpected behavior.",
             ))
 

@@ -211,69 +211,109 @@ def _is_na_value(value):
 
 
 def compute_phishing_indicators(hostname, cert_info, whois_info):
-    """Analyze multiple signals to compute phishing risk indicators."""
-    indicators = []
-    score_breakdown = {}  # for logging
+    """Analyze multiple signals to compute phishing risk indicators.
 
-    # ── Rule 1: SSL Invalid → +40 ────────────────────────────────
+    Scoring philosophy: risk signals are never fully cancelled by positive
+    indicators.  Positive indicators can reduce the score by at most 50% of
+    the negative (risk) total, so a site with ANY risk signal can never reach
+    score 0.  Multiple weak signals amplify each other.
+    """
+    indicators = []
+    risk_points = {}    # positive values = risk
+    bonus_points = {}   # negative values = trust
+
+    # helper to record a risk signal
+    def _risk(key, weight, signal, detail, category):
+        risk_points[key] = weight
+        indicators.append({"signal": signal, "detail": detail,
+                           "weight": weight, "category": category})
+
+    def _bonus(key, weight, signal, detail):
+        bonus_points[key] = weight
+        indicators.append({"signal": signal, "detail": detail,
+                           "weight": weight, "category": "positive"})
+
+    # ── 1. Certificate problems ───────────────────────────────────
     ssl_invalid = bool(cert_info.get("error")) or not cert_info.get("valid")
     if ssl_invalid:
-        weight = 40
-        score_breakdown["ssl_invalid"] = weight
-        indicators.append({
-            "signal": "SSL certificate invalid or missing",
-            "detail": cert_info.get("error") or "Certificate is not valid",
-            "weight": weight,
-            "category": "certificate"
-        })
+        _risk("ssl_invalid", 40,
+              "SSL certificate invalid or missing",
+              cert_info.get("error") or "Certificate is not valid",
+              "certificate")
 
     if cert_info.get("is_expired"):
-        indicators.append({
-            "signal": "Expired SSL certificate",
-            "detail": f"Expired {abs(cert_info.get('days_until_expiry', 0))} days ago",
-            "weight": 0,  # already counted in ssl_invalid
-            "category": "certificate"
-        })
+        _risk("cert_expired", 15,
+              "Expired SSL certificate",
+              f"Expired {abs(cert_info.get('days_until_expiry', 0))} days ago",
+              "certificate")
 
     if cert_info.get("days_until_expiry") is not None and 0 < cert_info["days_until_expiry"] < 30:
-        w = 10
-        score_breakdown["cert_expiring_soon"] = w
-        indicators.append({
-            "signal": "Certificate expiring soon",
-            "detail": f"Expires in {cert_info['days_until_expiry']} days",
-            "weight": w,
-            "category": "certificate"
-        })
+        _risk("cert_expiring_soon", 10,
+              "Certificate expiring soon",
+              f"Expires in {cert_info['days_until_expiry']} days",
+              "certificate")
 
+    # ── 2. TLS version analysis ───────────────────────────────────
+    tls_ver = (cert_info.get("protocol_version") or "").upper()
+    if tls_ver and tls_ver != "TLSV1.3":
+        w = 5 if "1.2" in tls_ver else 15
+        _risk("old_tls", w,
+              f"Outdated TLS version ({cert_info.get('protocol_version')})",
+              "Modern sites use TLS 1.3; older versions have known weaknesses",
+              "certificate")
+
+    # ── Institutional TLD detection (.edu.*, .gov.*, .mil.*) ──────
+    _institutional_tld = re.search(
+        r'\.(edu|gov|mil|ac|k12)(\.[a-z]{2,3})?$', hostname.lower()
+    )
+    is_institutional = bool(_institutional_tld)
+
+    # ── 3. Wildcard certificate detection ─────────────────────────
+    san_domains = cert_info.get("san_domains") or []
+    subject_cn = (cert_info.get("subject") or {}).get("commonName", "")
+    is_wildcard = subject_cn.startswith("*.") or any(d.startswith("*.") for d in san_domains)
+    if is_wildcard and not is_institutional:
+        num_sans = len(san_domains)
+        if num_sans <= 5:
+            _risk("wildcard_cert", 10,
+                  "Wildcard certificate detected",
+                  f"Cert covers {subject_cn} -- one cert can serve unlimited subdomains",
+                  "certificate")
+
+    # ── 4. Free / DV-only CA detection ────────────────────────────
     issuer = cert_info.get("issuer") or {}
     org = issuer.get("organizationName", "")
-    known_cas = ["Let's Encrypt", "DigiCert", "Comodo", "GlobalSign",
-                 "Sectigo", "GeoTrust", "Thawte", "VeriSign",
-                 "Amazon", "Google Trust Services", "Cloudflare",
-                 "Microsoft", "Baltimore", "ISRG"]
-    if org and not any(ca.lower() in org.lower() for ca in known_cas):
-        w = 15
-        score_breakdown["uncommon_ca"] = w
-        indicators.append({
-            "signal": "Uncommon certificate authority",
-            "detail": f"Issuer: {org}",
-            "weight": w,
-            "category": "certificate"
-        })
+    free_cas = ["Let's Encrypt", "ISRG", "ZeroSSL", "Buypass"]
+    premium_cas = ["DigiCert", "Comodo", "GlobalSign", "Sectigo",
+                   "GeoTrust", "Thawte", "VeriSign", "Amazon",
+                   "Google Trust Services", "Cloudflare", "Microsoft",
+                   "Baltimore", "Entrust"]
+    gov_cas = ["TUBITAK", "Kamu Sertifikasyon", "HARICA", "CFCA",
+               "SECOM", "CNNIC", "ACCV", "AC Camerfirma",
+               "Government", "Federal PKI"]
+    is_free_ca = any(ca.lower() in org.lower() for ca in free_cas) if org else False
+    is_gov_ca = any(ca.lower() in org.lower() for ca in gov_cas) if org else False
+    is_known_ca = is_free_ca or is_gov_ca or (any(ca.lower() in org.lower() for ca in premium_cas) if org else False)
 
-    # ── Rule 4: DNS resolution fail → +30 ────────────────────────
-    dns_failed = "DNS resolution failed" in (cert_info.get("error") or "")
-    if dns_failed:
-        w = 30
-        score_breakdown["dns_resolution_fail"] = w
-        indicators.append({
-            "signal": "DNS resolution failed",
-            "detail": f"Could not resolve hostname: {hostname}",
-            "weight": w,
-            "category": "dns"
-        })
+    if is_free_ca:
+        _risk("free_ca", 5,
+              "Free/DV-only certificate authority",
+              f"Issuer: {org} -- no organization validation performed",
+              "certificate")
+    elif org and not is_known_ca:
+        _risk("uncommon_ca", 15,
+              "Uncommon certificate authority",
+              f"Issuer: {org}",
+              "certificate")
 
-    # ── Rule 2: WHOIS all N/A → +20 ──────────────────────────────
+    # ── 5. DNS resolution failure ─────────────────────────────────
+    if "DNS resolution failed" in (cert_info.get("error") or ""):
+        _risk("dns_fail", 30,
+              "DNS resolution failed",
+              f"Could not resolve hostname: {hostname}",
+              "dns")
+
+    # ── 6. WHOIS signals ─────────────────────────────────────────
     whois_fields = [
         whois_info.get("registrar"),
         whois_info.get("creation_date"),
@@ -282,110 +322,170 @@ def compute_phishing_indicators(hostname, cert_info, whois_info):
         whois_info.get("domain_age_days"),
     ]
     whois_all_na = whois_info.get("available") and all(_is_na_value(f) for f in whois_fields)
-    if whois_all_na:
-        w = 20
-        score_breakdown["whois_all_na"] = w
-        indicators.append({
-            "signal": "All WHOIS data unavailable (N/A)",
-            "detail": "Every WHOIS field returned N/A — privacy proxy or restricted registry",
-            "weight": w,
-            "category": "whois"
-        })
-    elif not whois_info.get("available") and whois_info.get("error"):
-        w = 20
-        score_breakdown["whois_lookup_failed"] = w
-        indicators.append({
-            "signal": "WHOIS lookup failed",
-            "detail": whois_info["error"],
-            "weight": w,
-            "category": "whois"
-        })
 
-    # ── Rule 3: Phishing signals → add directly ──────────────────
-    if re.match(r'^\d+\.\d+\.\d+\.\d+$', hostname):
-        w = 20
-        score_breakdown["ip_as_hostname"] = w
-        indicators.append({
-            "signal": "IP address used instead of domain name",
-            "detail": "Legitimate sites use domain names",
-            "weight": w,
-            "category": "domain"
-        })
-
-    suspicious_keywords = ["login", "secure", "account", "verify", "update",
-                           "confirm", "banking", "paypal", "signin", "password"]
-    found_keywords = [kw for kw in suspicious_keywords if kw in hostname.lower()]
-    if found_keywords and len(hostname.split('.')) > 3:
-        w = 20
-        score_breakdown["suspicious_keywords"] = w
-        indicators.append({
-            "signal": "Suspicious keywords in subdomain-heavy URL",
-            "detail": f"Keywords: {', '.join(found_keywords)}; depth: {len(hostname.split('.'))}",
-            "weight": w,
-            "category": "domain"
-        })
-
-    if len(hostname.split('.')) > 4:
-        w = 10
-        score_breakdown["excessive_subdomains"] = w
-        indicators.append({
-            "signal": "Excessive subdomain depth",
-            "detail": f"{len(hostname.split('.'))} subdomain levels",
-            "weight": w,
-            "category": "domain"
-        })
-
-    if re.search(r'[0-9]', hostname.split('.')[0]) and re.search(r'[a-z]', hostname.split('.')[0]):
-        if len(hostname.split('.')[0]) > 10:
-            w = 10
-            score_breakdown["mixed_alphanumeric"] = w
-            indicators.append({
-                "signal": "Mixed alphanumeric hostname",
-                "detail": "May indicate randomly generated domain",
-                "weight": w,
-                "category": "domain"
-            })
+    if whois_all_na and not is_institutional:
+        _risk("whois_all_na", 20,
+              "All WHOIS data unavailable (N/A)",
+              "Every WHOIS field returned N/A -- privacy proxy or restricted registry",
+              "whois")
+    elif not whois_info.get("available") and whois_info.get("error") and not is_institutional:
+        _risk("whois_failed", 20,
+              "WHOIS lookup failed", whois_info["error"], "whois")
 
     if whois_info.get("available") and not whois_all_na:
         if _is_na_value(whois_info.get("registrar")):
-            w = 15
-            score_breakdown["registrar_missing"] = w
-            indicators.append({
-                "signal": "Registrar information missing",
-                "detail": "No registrar in WHOIS — privacy shield or suspicious registration",
-                "weight": w,
-                "category": "whois"
-            })
+            _risk("registrar_missing", 15,
+                  "Registrar information missing",
+                  "No registrar in WHOIS -- privacy shield or suspicious registration",
+                  "whois")
 
         age = whois_info.get("domain_age_days")
         if age is not None:
             if age < 30:
-                w = 25
-                score_breakdown["domain_very_new"] = w
-                indicators.append({"signal": "Very recently registered domain", "detail": f"{age} days old", "weight": w, "category": "whois"})
+                _risk("domain_very_new", 25,
+                      "Very recently registered domain",
+                      f"{age} days old", "whois")
             elif age < 180:
-                w = 10
-                score_breakdown["domain_new_6mo"] = w
-                indicators.append({"signal": "Recently registered domain", "detail": f"{age} days old (< 6 months)", "weight": w, "category": "whois"})
+                _risk("domain_new_6mo", 10,
+                      "Recently registered domain",
+                      f"{age} days old (< 6 months)", "whois")
             elif age < 365:
-                w = 5
-                score_breakdown["domain_under_1yr"] = w
-                indicators.append({"signal": "Domain younger than 1 year", "detail": f"{age} days old", "weight": w, "category": "whois"})
+                _risk("domain_under_1yr", 5,
+                      "Domain younger than 1 year",
+                      f"{age} days old", "whois")
 
-    # ── Positive indicators ───────────────────────────────────────
+    # ── 7. Domain / hostname signals ──────────────────────────────
+    if re.match(r'^\d+\.\d+\.\d+\.\d+$', hostname):
+        _risk("ip_hostname", 20,
+              "IP address used instead of domain name",
+              "Legitimate sites use domain names", "domain")
+
+    # Suspicious keywords -- split into high-threat and moderate
+    high_threat_kw = ["phishing", "malware", "hack", "spoof", "fraud",
+                      "scam", "exploit", "trojan", "ransomware"]
+    moderate_kw = ["login", "secure", "account", "verify", "update",
+                   "confirm", "banking", "paypal", "signin", "password",
+                   "wallet", "crypto", "authenticate"]
+    found_high = [kw for kw in high_threat_kw if kw in hostname.lower()]
+    found_mod = [kw for kw in moderate_kw if kw in hostname.lower()]
+
+    if found_high:
+        _risk("high_threat_keywords", 45,
+              "High-threat keywords in domain name",
+              f"Keywords: {', '.join(found_high)}",
+              "domain")
+    if found_mod:
+        deep = len(hostname.split('.')) > 3
+        w = 30 if deep else 20
+        _risk("suspicious_keywords", w,
+              "Suspicious keywords in domain name",
+              f"Keywords: {', '.join(found_mod)}; depth: {len(hostname.split('.'))}",
+              "domain")
+
+    # Subdomain impersonation: suspicious subdomain on unrelated parent
+    parts = hostname.lower().split('.')
+    if len(parts) >= 3:
+        subdomain = parts[0]
+        parent = '.'.join(parts[-2:])
+        all_threat_kw = high_threat_kw + moderate_kw
+        sub_has_keyword = any(kw in subdomain for kw in all_threat_kw)
+        parent_has_keyword = any(kw in parent for kw in all_threat_kw)
+        if sub_has_keyword and not parent_has_keyword:
+            _risk("subdomain_impersonation", 15,
+                  "Suspicious subdomain on unrelated parent domain",
+                  f"Subdomain '{subdomain}' contains threat keywords but parent '{parent}' does not",
+                  "domain")
+
+    if len(parts) > 4:
+        _risk("excessive_subdomains", 10,
+              "Excessive subdomain depth",
+              f"{len(parts)} subdomain levels", "domain")
+
+    if re.search(r'[0-9]', parts[0]) and re.search(r'[a-z]', parts[0]) and len(parts[0]) > 10:
+        _risk("mixed_alphanum", 10,
+              "Mixed alphanumeric hostname",
+              "May indicate randomly generated domain", "domain")
+
+    # ── 8. Government impersonation ──────────────────────────────
+    gov_terms = ["gov", "government", "federal", "irs", "ssa", "medicare"]
+    has_gov_term = any(t in hostname.lower() for t in gov_terms)
+    is_real_gov = hostname.lower().endswith(".gov") or re.search(r'\.gov\.[a-z]{2,3}$', hostname.lower())
+    if has_gov_term and not is_real_gov and not is_institutional:
+        _risk("gov_impersonation", 35,
+              "Government impersonation detected",
+              f"Domain contains '{next(t for t in gov_terms if t in hostname.lower())}' but is not a .gov site",
+              "domain")
+
+    # ── 9. Scam bait keywords ─────────────────────────────────────
+    bait_kw = ["free", "iphone", "tablet", "prize", "winner", "gift",
+               "giveaway", "reward", "bonus", "cashapp", "venmo"]
+    found_bait = [kw for kw in bait_kw if kw in hostname.lower()]
+    if found_bait:
+        w = 30 if len(found_bait) >= 2 else 20
+        _risk("scam_bait", w,
+              "Scam bait keywords in domain name",
+              f"Keywords: {', '.join(found_bait)}",
+              "domain")
+
+    # ── 10. Multi-domain SAN analysis ─────────────────────────────
+    # One cert covering many unrelated domains = scam network
+    if san_domains:
+        unique_roots = set()
+        for san in san_domains:
+            san_clean = san.lstrip("*.")
+            san_parts = san_clean.split(".")
+            if len(san_parts) >= 2:
+                unique_roots.add(".".join(san_parts[-2:]))
+        if len(unique_roots) >= 3:
+            _risk("multi_domain_cert", 25,
+                  "Certificate covers multiple unrelated domains",
+                  f"{len(unique_roots)} different domains on one cert: {', '.join(sorted(unique_roots)[:5])}",
+                  "certificate")
+
+    # ── 11. Compound signal amplification ─────────────────────────
+    has_risk_keywords = any(k in risk_points for k in
+        ["high_threat_keywords", "suspicious_keywords", "scam_bait", "gov_impersonation"])
+    if is_wildcard and is_free_ca and has_risk_keywords:
+        _risk("phishing_infra", 15,
+              "Phishing infrastructure pattern detected",
+              "Wildcard cert + free CA + suspicious domain -- classic phishing setup",
+              "compound")
+
+    # ── 9. Positive indicators ────────────────────────────────────
     if cert_info.get("valid") and not cert_info.get("is_expired"):
-        w = -10
-        score_breakdown["valid_ssl"] = w
-        indicators.append({"signal": "Valid SSL certificate", "detail": f"Valid until {cert_info.get('not_after', 'N/A')}", "weight": w, "category": "positive"})
+        _bonus("valid_ssl", -10,
+               "Valid SSL certificate",
+               f"Valid until {cert_info.get('not_after', 'N/A')}")
 
     age_days = whois_info.get("domain_age_days")
     if age_days and age_days > 365:
-        w = -15
-        score_breakdown["established_domain"] = w
-        indicators.append({"signal": "Established domain", "detail": f"{age_days // 365} years old", "weight": w, "category": "positive"})
+        _bonus("established_domain", -15,
+               "Established domain",
+               f"{age_days // 365} years old")
 
-    # ── Final score ───────────────────────────────────────────────
-    risk_score = max(0, min(100, sum(score_breakdown.values())))
+    if org and any(ca.lower() in org.lower() for ca in premium_cas):
+        _bonus("premium_ca", -5,
+               "Premium certificate authority",
+               f"Issuer: {org}")
+
+    if is_gov_ca:
+        _bonus("gov_ca", -10,
+               "Government/institutional certificate authority",
+               f"Issuer: {org}")
+
+    if is_institutional:
+        _bonus("institutional_tld", -15,
+               "Institutional domain (edu/gov/mil)",
+               f"Domain: {hostname}")
+
+    # ── 10. Final score ───────────────────────────────────────────
+    # Positive indicators can reduce risk by at most 50%
+    raw_risk = sum(risk_points.values())
+    raw_bonus = abs(sum(bonus_points.values()))
+    capped_bonus = min(raw_bonus, raw_risk * 0.5)
+    risk_score = max(0, min(100, round(raw_risk - capped_bonus)))
+
+    score_breakdown = {**risk_points, **bonus_points, "_capped_bonus": -capped_bonus}
 
     logger.debug(
         "[SecurityHunter] %s | score=%d/100 | breakdown=%s",

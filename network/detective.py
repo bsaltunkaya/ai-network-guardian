@@ -71,8 +71,13 @@ MAC_VENDORS = {
     "00:19:CB": "ZyXEL", "00:1F:57": "ZyXEL",
     "00:23:F8": "ZyXEL", "00:26:F3": "ZyXEL",
     "FC:F5:28": "ZyXEL", "B0:B2:DC": "ZyXEL",
+    "80:EA:0B": "ZyXEL", "A0:E4:CB": "ZyXEL",
     "7C:B0:C2": "Intel", "68:17:29": "Intel",
     "34:02:86": "Intel", "A4:34:D9": "Intel",
+    "5C:E9:1E": "Intel",
+    "6C:5A:B0": "TP-Link", "98:DA:C4": "TP-Link",
+    "B0:95:75": "TP-Link", "14:EB:B6": "TP-Link",
+    "60:32:B1": "TP-Link", "C0:06:C3": "TP-Link",
     "DC:A6:32": "Raspberry Pi", "E4:5F:01": "Raspberry Pi",
     "00:1E:06": "Wibrain",
     "AA:BB:CC": "Private/Unknown",
@@ -101,14 +106,31 @@ VENDOR_DEVICE_TYPES = {
     "VMware": "Virtual Machine",
     "VirtualBox": "Virtual Machine",
     "Toshiba": "Computer",
+    "Randomized (Private)": "Phone/Tablet (MAC Randomized)",
 }
+
+
+def _is_locally_administered(mac_address):
+    """Check if MAC is locally administered (randomized/private)."""
+    try:
+        first_octet = int(mac_address.split(":")[0], 16)
+        return bool(first_octet & 0x02)
+    except (ValueError, IndexError):
+        return False
 
 
 def lookup_mac_vendor(mac_address):
     """Look up the vendor from MAC address OUI prefix."""
     mac_upper = mac_address.upper().replace("-", ":")
+    # Zero-pad each octet for consistent lookup
+    mac_upper = ":".join(o.zfill(2) for o in mac_upper.split(":"))
     prefix = mac_upper[:8]
-    return MAC_VENDORS.get(prefix, "Unknown Vendor")
+    vendor = MAC_VENDORS.get(prefix)
+    if vendor:
+        return vendor
+    if _is_locally_administered(mac_upper):
+        return "Randomized (Private)"
+    return "Unknown Vendor"
 
 
 def estimate_device_type(vendor):
@@ -202,7 +224,8 @@ def get_arp_table(local_ip: str = ""):
                 if not m:
                     continue
                 ip  = m.group(1)
-                mac = m.group(2).upper()
+                # Normalize MAC: zero-pad single-digit octets (e.g. b -> 0B)
+                mac = ":".join(o.zfill(2) for o in m.group(2).split(":")).upper()
                 if mac in ("FF:FF:FF:FF:FF:FF", "(INCOMPLETE)"):
                     continue
 
